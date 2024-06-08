@@ -1,4 +1,6 @@
 import ast
+import asyncio
+import base64
 import contextlib
 import functools
 import gc
@@ -18,11 +20,13 @@ import threading
 import time
 import traceback
 import zipfile
+import tarfile
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from typing import Tuple, Callable, Dict
 from queue import Queue, Empty
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
 
 import filelock
 import fire
@@ -30,11 +34,18 @@ import numpy as np
 import pandas as pd
 import requests
 import uuid
+import re
+from packaging import version
 
 import tabulate
 from fire import inspectutils
 from joblib import Parallel
 from tqdm.auto import tqdm
+
+from src.enums import split_google, invalid_json_str, docs_joiner_default, git_hash_unset
+from src.utils_procs import reulimit
+
+reulimit()
 
 
 def H2O_Fire(component=None):
@@ -92,7 +103,9 @@ def flatten_list(lis):
     return new_lis
 
 
-def clear_torch_cache():
+def clear_torch_cache(allow_skip=False):
+    if allow_skip and os.getenv('CLEAR_CLEAR_TORCH', '2') == '1' or os.getenv('CLEAR_CLEAR_TORCH', '2') == '0':
+        return
     try:
         import torch
         if torch.cuda.is_available():
@@ -135,9 +148,9 @@ def get_torch_allocated():
     return torch.cuda.memory_allocated()
 
 
-def get_device():
+def get_device(n_gpus=None):
     import torch
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and n_gpus != 0:
         device = "cuda"
     elif torch.backends.mps.is_built():
         device = "mps"
@@ -189,6 +202,18 @@ def system_info():
         pass
     system['hash'] = get_githash()
 
+    debug_mem = False
+    if debug_mem:
+        try:
+            # pip install guppy3
+            from guppy import hpy
+            h = hpy()
+            print(h.heap())
+            print(h.heap().byvia)
+            print(h.heap().byid)
+        except:
+            pass
+
     return system
 
 
@@ -237,25 +262,70 @@ def _zip_data(root_dirs=None, zip_file=None, base_dir='./'):
     return zip_file, zip_file
 
 
+def tar_data(root_dirs=None, tar_file=None, base_dir='./', fail_any_exception=False):
+    try:
+        return _tar_data(tar_file=tar_file, base_dir=base_dir, root_dirs=root_dirs)
+    except Exception as e:
+        traceback.print_exc()
+        print('Exception in tar archiving: %s' % str(e))
+        if not fail_any_exception:
+            raise
+
+
+def _tar_data(root_dirs=None, tar_file=None, base_dir='./'):
+    if isinstance(root_dirs, str):
+        root_dirs = [root_dirs]
+    if tar_file is None:
+        datetime_str = str(datetime.now()).replace(" ", "_").replace(":", "_")
+        host_name = os.getenv('HF_HOSTNAME', 'emptyhost')
+        tar_file = "data_%s_%s.tar.gz" % (datetime_str, host_name)
+    assert root_dirs is not None
+    base_path = os.path.dirname(tar_file)
+    if not os.path.isdir(base_path) and os.path.dirname(tar_file):
+        base_path = makedirs(base_path, exist_ok=True, tmp_ok=True, use_base=True)
+        tar_file = os.path.join(base_path, os.path.basename(tar_file))
+    with tarfile.open(tar_file, "w:gz") as expt_tar:
+        for root_dir in root_dirs:
+            if root_dir is None:
+                continue
+            for root, d, files in os.walk(root_dir):
+                for file in files:
+                    file_to_archive = os.path.join(root, file)
+                    assert os.path.exists(file_to_archive)
+                    path_to_archive = os.path.relpath(file_to_archive, base_dir)
+                    expt_tar.add(name=file_to_archive, arcname=path_to_archive)
+    return tar_file, tar_file
+
+
 def save_generate_output(prompt=None, output=None, base_model=None, save_dir=None, where_from='unknown where from',
-                         extra_dict={}, error='', extra='', which_api='', valid_key=None,
-                         h2ogpt_key='', return_dict=False):
+                         extra_dict={}, error='', sources=[], which_api='', valid_key=None,
+                         h2ogpt_key='', return_dict=False, **kwargs_extra):
     if not save_dir:
         return
     try:
         return _save_generate_output(prompt=prompt, output=output, base_model=base_model, save_dir=save_dir,
-                                     where_from=where_from, extra_dict=extra_dict, error=error, extra=extra,
+                                     where_from=where_from, extra_dict=extra_dict, error=error, sources=sources,
                                      which_api=which_api, valid_key=valid_key, h2ogpt_key=h2ogpt_key,
-                                     return_dict=return_dict)
+                                     return_dict=return_dict, **kwargs_extra)
     except Exception as e:
         traceback.print_exc()
         print('Exception in saving: %s' % str(e))
 
 
+def _save_generate_tokens(response_no_refs, extra_dict):
+    # tokenize at end if need to, so doesn't block generation in multi-generator case
+    if extra_dict.get('ntokens') is None:
+        extra_dict['ntokens'] = FakeTokenizer().num_tokens_from_string(str(response_no_refs))
+        # only do below if didn't already compute ntokens, else assume also computed rate
+    if extra_dict.get('ntokens') is not None and extra_dict.get('t_generate') is not None:
+        extra_dict['tokens_persecond'] = extra_dict['ntokens'] / extra_dict['t_generate']
+    return extra_dict
+
+
 def _save_generate_output(prompt=None, output=None, base_model=None, save_dir=None, where_from='unknown where from',
-                          extra_dict={}, error='', extra='', which_api='',
+                          extra_dict={}, error='', sources=[], which_api='',
                           valid_key=None, h2ogpt_key='',
-                          return_dict=False):
+                          return_dict=False, **kwargs_extra):
     """
     Save conversation to .json, row by row.
     json_file_path is path to final JSON file. If not in ., then will attempt to make directories.
@@ -264,22 +334,19 @@ def _save_generate_output(prompt=None, output=None, base_model=None, save_dir=No
     prompt = '<not set>' if prompt is None else prompt
     output = '<not set>' if output is None else output
 
-    # tokenize at end if need to, so doesn't block generation in multi-generator case
-    if extra_dict.get('ntokens') is None:
-        extra_dict['ntokens'] = FakeTokenizer().num_tokens_from_string(output)
-        # only do below if didn't already compute ntokens, else assume also computed rate
-        extra_dict['tokens_persecond'] = extra_dict['ntokens'] / extra_dict['t_generate']
+    extra_dict = _save_generate_tokens(output, extra_dict)
 
     dict_to_save = dict(prompt=prompt, text=output, time=time.ctime(),
                         base_model=base_model,
                         where_from=where_from,
                         error=error,
-                        extra=extra,
+                        sources=sources,
                         which_api=which_api,
                         valid_key=valid_key,
                         h2ogpt_key=h2ogpt_key,
                         )
     dict_to_save.update(extra_dict)
+    dict_to_save.update(kwargs_extra)
 
     if return_dict:
         return dict_to_save
@@ -332,10 +399,30 @@ def _s3up(filename):
 
 
 def get_githash():
+    githash = git_hash_unset
     try:
         githash = subprocess.run(['git', 'rev-parse', 'HEAD'], stdout=subprocess.PIPE).stdout.decode('utf-8')[0:-1]
-    except:
-        githash = ''
+        if githash in ['', None]:
+            githash = git_hash_unset
+    except Exception as e:
+        print("git failed to run: %s" % str(e))
+    if githash == git_hash_unset:
+        try:
+            with open('git_hash.txt', 'rt') as f:
+                githash = f.read().strip()
+        except Exception as e:
+            print("git_hash.txt failed to be found: %s" % str(e))
+
+    if githash == git_hash_unset:
+        try:
+            from src.version import __version__
+            githash = __version__
+        except:
+            pass
+
+    if os.getenv('HARD_ASSERTS'):
+        assert is_full_git_hash(githash)
+
     return githash
 
 
@@ -378,6 +465,26 @@ class NullContext(threading.local):
         pass
 
 
+class AsyncNullContext(threading.local):
+    """No-op async context manager, executes block without doing any additional processing.
+
+    Used as a stand-in if a particular block of code is only sometimes
+    used with a normal async context manager:
+    """
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, exc_traceback):
+        await self.finally_act()
+
+    async def finally_act(self):
+        pass
+
+
 def wrapped_partial(func, *args, **kwargs):
     """
     Give partial properties of normal function, like __name__ attribute etc.
@@ -398,24 +505,29 @@ class ThreadException(Exception):
 class EThread(threading.Thread):
     # Function that raises the custom exception
     def __init__(self, group=None, target=None, name=None,
-                 args=(), kwargs=None, *, daemon=None, streamer=None, bucket=None):
+                 args=(), kwargs=None, *, daemon=None, streamer=None, bucket=None,
+                 async_output=False):
         self.bucket = bucket
         self.streamer = streamer
         self.exc = None
         self._return = None
+        self.async_output = async_output
         super().__init__(group=group, target=target, name=name, args=args, kwargs=kwargs, daemon=daemon)
 
     def run(self):
         # Variable that stores the exception, if raised by someFunction
         try:
             if self._target is not None:
-                self._return = self._target(*self._args, **self._kwargs)
+                if self.async_output:
+                    self._return = asyncio.run(self._target(*self._args, **self._kwargs))
+                else:
+                    self._return = self._target(*self._args, **self._kwargs)
         except BaseException as e:
-            print("thread exception: %s" % str(sys.exc_info()))
+            print("thread exception: %s" % str(traceback.format_exc()))
             self.bucket.put(sys.exc_info())
             self.exc = e
             if self.streamer:
-                print("make stop: %s" % str(sys.exc_info()), flush=True)
+                print("make stop: %s" % str(traceback.format_exc()), flush=True)
                 self.streamer.do_stop = True
         finally:
             # Avoid a refcycle if the thread is running a function with
@@ -440,8 +552,6 @@ def import_matplotlib():
     import pandas as pd
     # to avoid dlopen deadlock in fork
     import pandas.core.computation.expressions as pd_expressions
-    import pandas._libs.groupby as pd_libgroupby
-    import pandas._libs.reduction as pd_libreduction
     import pandas.core.algorithms as pd_algorithms
     import pandas.core.common as pd_com
     import numpy as np
@@ -452,10 +562,11 @@ def get_sha(value):
     return hashlib.md5(str(value).encode('utf-8')).hexdigest()
 
 
-def sanitize_filename(name):
+def sanitize_filename(name, file_length_limit=250):
     """
     Sanitize file *base* names.
     :param name: name to sanitize
+    :param file_length_limit: bit smaller than 256 for safety
     :return:
     """
     bad_chars = ['[', ']', ',', '/', '\\', '\\w', '\\s', '-', '+', '\"', '\'', '>', '<', ' ', '=', ')', '(', ':', '^']
@@ -463,9 +574,9 @@ def sanitize_filename(name):
         name = name.replace(char, "_")
 
     length = len(name)
-    file_length_limit = 250  # bit smaller than 256 for safety
     sha_length = 32
     real_length_limit = file_length_limit - (sha_length + 2)
+    assert real_length_limit > 0, "Bad file limit length: %s %s" % (file_length_limit, real_length_limit)
     if length > file_length_limit:
         sha = get_sha(name)
         half_real_length_limit = max(1, int(real_length_limit / 2))
@@ -541,7 +652,7 @@ def atomic_move_simple(src, dst):
     remove(src)
 
 
-def download_simple(url, dest=None):
+def download_simple(url, dest=None, overwrite=False, verbose=False):
     if dest is None:
         dest = os.path.basename(url)
     base_path = os.path.dirname(dest)
@@ -550,10 +661,14 @@ def download_simple(url, dest=None):
         dest = os.path.join(base_path, os.path.basename(dest))
 
     if os.path.isfile(dest):
-        print("Already have %s from url %s, delete file if invalid" % (dest, str(url)), flush=True)
-        return dest
+        if not overwrite:
+            print("Already have %s from url %s, delete file if invalid" % (dest, str(url)), flush=True)
+            return dest
+        else:
+            remove(dest)
 
-    print("BEGIN get url %s" % str(url), flush=True)
+    if verbose:
+        print("BEGIN get url %s" % str(url), flush=True)
     if url.startswith("file://"):
         from requests_file import FileAdapter
         s = requests.Session()
@@ -561,7 +676,8 @@ def download_simple(url, dest=None):
         url_data = s.get(url, stream=True)
     else:
         url_data = requests.get(url, stream=True)
-    print("GOT url %s" % str(url), flush=True)
+    if verbose:
+        print("GOT url %s" % str(url), flush=True)
 
     if url_data.status_code != requests.codes.ok:
         msg = "Cannot get url %s, code: %s, reason: %s" % (
@@ -574,10 +690,23 @@ def download_simple(url, dest=None):
 
     uuid_tmp = str(uuid.uuid4())[:6]
     dest_tmp = dest + "_dl_" + uuid_tmp + ".tmp"
-    with open(dest_tmp, "wb") as f:
-        shutil.copyfileobj(url_data.raw, f)
+
+    # Sizes in bytes.
+    total_size = int(url_data.headers.get("content-length", 0))
+    block_size = 1024
+
+    with tqdm(total=total_size, unit="B", unit_scale=True) as progress_bar:
+        with open(dest_tmp, "wb") as file:
+            for data in url_data.iter_content(block_size):
+                progress_bar.update(len(data))
+                file.write(data)
+
+    if total_size != 0 and progress_bar.n != total_size:
+        raise RuntimeError("Could not download file")
+
     atomic_move_simple(dest_tmp, dest)
-    print("DONE url %s" % str(url), flush=True)
+    if verbose:
+        print("DONE url %s" % str(url), flush=True)
     return dest
 
 
@@ -633,6 +762,59 @@ def get_doc(x):
 
 def get_source(x):
     return x.metadata.get('source', "UNKNOWN SOURCE")
+
+
+def markdown_to_html(content):
+    import markdown
+
+    # Create a Markdown object
+    markdowner = markdown.Markdown()
+
+    # Convert the Markdown block to HTML
+    try:
+        html = markdowner.reset().convert(content)
+    except Exception as e:
+        # FIXME:
+        print("Invalid conversion of markdown to html: %s\n\n%s" % (content, str(e)))
+        html = content
+
+    return html
+
+
+def is_markdown(string):
+    """Returns True if the string is markdown, False otherwise."""
+
+    # Check for the presence of double square brackets
+    if re.search(r'\[\[.+?\]\]', string):
+        return True
+
+    # Check for the presence of angle brackets
+    if re.search(r'<.+?>', string):
+        return False
+
+    # If neither of the above patterns are found, assume the string is markdown
+    return True
+
+
+def get_accordion_named(content, title, font_size=8):
+    # content = content.replace('\n', '<br>')
+    if is_markdown(content):
+        content = markdown_to_html(content)
+    return f"""<details><summary><font size="{font_size}">{title}</font></summary><font size="{font_size}">{content}</font></details>"""
+
+
+def hyde_titles(level):
+    if level == 0:
+        title = "HYDE 0: LLM"
+    elif level == 1:
+        title = "HYDE 1: Prompt+LLM embedding"
+    elif level == 2:
+        title = "HYDE 2: Prompt+LLM+HYDE 1 embedding"
+    elif level == 3:
+        title = "HYDE 3: Prompt+LLM+HYDE 1&2 embedding"
+    else:
+        title = "HYDE 4: Prompt+LLM+HYDE 1&2&3 embedding"
+    return title
 
 
 def get_accordion(x, font_size=2, head_acc=50):
@@ -701,7 +883,7 @@ def cuda_vis_check(total_gpus):
 
 
 def get_ngpus_vis(raise_if_exception=True):
-    ngpus_vis1 = 0
+    ngpus_vis1 = None
 
     shell = False
     if shell:
@@ -724,6 +906,13 @@ def get_ngpus_vis(raise_if_exception=True):
         print('Failed get_ngpus_vis: %s' % str(e))
         if raise_if_exception:
             raise
+
+    if ngpus_vis1 is None:
+        import torch
+        if get_device() == 'cuda':
+            ngpus_vis1 = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        else:
+            ngpus_vis1 = 0
 
     ngpus_vis1, which_gpus = cuda_vis_check(ngpus_vis1)
     return ngpus_vis1
@@ -757,6 +946,9 @@ def get_mem_gpus(raise_if_exception=True, ngpus=None):
             raise
 
     return totalmem_gpus1, usedmem_gpus1, freemem_gpus1
+
+
+n_gpus_global = get_ngpus_vis()
 
 
 class ForkContext(threading.local):
@@ -903,15 +1095,15 @@ class _ForkDataContext(threading.local):
 
 forkdatacontext = _ForkDataContext()
 
-# Add user info
-username = getpass.getuser()
-current_working_directory = os.getcwd()
-operating_system = platform.system()
-
 
 def _traced_func(func, *args, **kwargs):
-    func, args, kwargs = forkdatacontext.get_args_kwargs_for_traced_func(func, args, kwargs)
-    return func(*args, **kwargs)
+    try:
+        func, args, kwargs = forkdatacontext.get_args_kwargs_for_traced_func(func, args, kwargs)
+        return func(*args, **kwargs)
+    except BaseException as e:
+        print(e)
+        ex = traceback.format_exc()
+        raise RuntimeError(str(ex))
 
 
 def call_subprocess_onetask(func, args=None, kwargs=None):
@@ -985,13 +1177,6 @@ try:
 except (PackageNotFoundError, AssertionError):
     pass
 
-have_chromamigdb = False
-try:
-    assert distribution('chromamigdb') is not None
-    have_chromamigdb = True
-except (PackageNotFoundError, AssertionError):
-    pass
-
 have_serpapi = False
 try:
     assert distribution('google-search-results') is not None
@@ -1010,13 +1195,16 @@ def hash_file(file):
         md5 = hashlib.md5()
         # sha1 = hashlib.sha1()
 
-        with open(file, 'rb') as f:
-            while True:
-                data = f.read(BUF_SIZE)
-                if not data:
-                    break
-                md5.update(data)
-                # sha1.update(data)
+        if not os.path.isfile(file):
+            md5.update(file.encode(encoding='UTF-8'))
+        else:
+            with open(file, 'rb') as f:
+                while True:
+                    data = f.read(BUF_SIZE)
+                    if not data:
+                        break
+                    md5.update(data)
+                    # sha1.update(data)
     except BaseException as e:
         print("Cannot hash %s due to %s" % (file, str(e)))
         traceback.print_exc()
@@ -1039,13 +1227,53 @@ def start_faulthandler():
 
 def get_hf_server(inference_server):
     inf_split = inference_server.split("    ")
-    assert len(inf_split) == 1 or len(inf_split) == 3
-    inference_server = inf_split[0]
     if len(inf_split) == 3:
+        assert len(inf_split) == 1 or len(inf_split) == 3
+        inference_server = inf_split[0]
         headers = {"authorization": "%s %s" % (inf_split[1], inf_split[2])}
+        user = None
+        password = None
     else:
+        ip_port_vllm = ':'.join(inference_server.split(':')[0:])
+        if ip_port_vllm.startswith('https://'):
+            http_prefix = 'https://'
+            ip_port_vllm = ip_port_vllm[len(http_prefix):]
+        elif ip_port_vllm.startswith('http://'):
+            http_prefix = 'http://'
+            ip_port_vllm = ip_port_vllm[len(http_prefix):]
+        else:
+            http_prefix = 'http://'
+
+        inf_split = ip_port_vllm.split(":")
+        if len(inf_split) <= 2:
+            # i.e. just DNS or IP and no port or IP + port
+            user = None
+            password = None
+        elif len(inf_split) == 3:
+            # i.e. just DNS or IP, no port + user + pass = 3
+            user = inf_split[len(inf_split) - 2]
+            password = inf_split[len(inf_split) - 1]
+            ip_port_vllm = ':'.join(inf_split[:len(inf_split) - 2])
+        elif len(inf_split) == 4:
+            # i.e. DNS/IP + port + user + pass = 4
+            port = inf_split[len(inf_split) - 3]
+            user = inf_split[len(inf_split) - 2]
+            password = inf_split[len(inf_split) - 1]
+            if port not in [None, 'None']:
+                ip_port_vllm = ':'.join([inf_split[0], port])
+            else:
+                ip_port_vllm = inf_split[0]
+
+        else:
+            raise ValueError("Malformed inference_server=%s" % inference_server)
+
         headers = None
-    return inference_server, headers
+
+        # remove None if port was None
+        if 'None' in ip_port_vllm.split(':'):
+            ip_port_vllm = ':'.join([x for x in ip_port_vllm.split(':') if x != 'None'])
+        inference_server = http_prefix + ip_port_vllm
+    return inference_server, headers, user, password
 
 
 class FakeTokenizer:
@@ -1054,26 +1282,57 @@ class FakeTokenizer:
     2) For when model doesn't directly expose tokenizer but need to count tokens
     """
 
-    def __init__(self, model_max_length=2048, encoding_name="cl100k_base", is_openai=False,
+    def __init__(self, model_max_length=2048,
+                 encoding_name="cl100k_base",
+                 is_openai=False,
+                 is_anthropic=False,
+                 is_google=False,
+                 is_hf=False,
                  tokenizer=None,
-                 is_llama_cpp=False):
+                 is_llama_cpp=False,
+                 is_super_fake=False,
+                 ):
         if model_max_length is None:
+            assert not (
+                    is_openai or is_anthropic or is_google), "Should have set model_max_length for OpenAI or Anthropic or Google"
             model_max_length = 2048
         self.is_openai = is_openai
+        self.is_anthropic = is_anthropic
+        self.is_google = is_google
+        self.is_hf = is_hf
         self.is_llama_cpp = is_llama_cpp
+        self.is_super_fake = is_super_fake
         self.tokenizer = tokenizer
         self.model_max_length = model_max_length
-        if not self.is_openai and not self.is_llama_cpp:
+        if not self.is_openai and not self.is_anthropic and not self.is_llama_cpp:
             # don't push limit, since if using fake tokenizer, only estimate, and seen underestimates by order 250
             self.model_max_length -= 250
         self.encoding_name = encoding_name
+        if self.is_super_fake:
+            self.encoding = None
         # The first time this runs, it will require an internet connection to download. Later runs won't need an internet connection.
-        import tiktoken
-        self.encoding = tiktoken.get_encoding(self.encoding_name)
+        elif not (self.is_anthropic or self.is_google):
+            import tiktoken
+            self.encoding = tiktoken.get_encoding(self.encoding_name)
+        else:
+            self.encoding = None
 
     def encode(self, x, *args, return_tensors="pt", **kwargs):
-        if self.is_llama_cpp:  # and len(x) < 4 * 4 * self.model_max_length: # don't use llama.cpp if too much
+        if self.is_super_fake:
+            input_ids = self.heuristic_encode(x)
+            # avoid torch tensor
+            return dict(input_ids=input_ids)
+        elif self.is_llama_cpp:  # and len(x) < 4 * 4 * self.model_max_length: # don't use llama.cpp if too much
             input_ids = self.tokenizer.tokenize(b" " + x.encode("utf-8"))
+        elif self.is_anthropic:
+            from anthropic import Anthropic
+            client = Anthropic()
+            tokenizer = client.get_tokenizer()
+            input_ids = tokenizer.encode(x).ids
+        elif self.is_google:
+            input_ids = [0] * self.tokenizer(x).total_tokens  # fake tokens
+        elif self.is_hf:
+            input_ids = self.tokenizer.encode(x)
         else:
             input_ids = self.encoding.encode(x, disallowed_special=())
         if return_tensors == 'pt' and isinstance(input_ids, list):
@@ -1082,15 +1341,43 @@ class FakeTokenizer:
         return dict(input_ids=input_ids)
 
     def decode(self, x, *args, **kwargs):
-        if self.is_llama_cpp:  # and len(x) < 4 * self.model_max_length:   # don't use llama.cpp if too much
+        if self.is_super_fake:
+            return ['aaaa'] * len(x)  # fake
+        elif self.is_llama_cpp:  # and len(x) < 4 * self.model_max_length:   # don't use llama.cpp if too much
             return self.tokenizer.detokenize(x)
+        elif self.is_anthropic:
+            from anthropic import Anthropic
+            client = Anthropic()
+            tokenizer = client.get_tokenizer()
+            return tokenizer.decode(x)
+        elif self.is_google:
+            return ['a'] * len(x)  # fake
+        elif self.is_hf:
+            return self.tokenizer.decode(x)
         # input is input_ids[0] form
         return self.encoding.decode(x)
 
     def num_tokens_from_string(self, prompt: str) -> int:
         """Returns the number of tokens in a text string."""
+        if self.is_super_fake:
+            return len(self.heuristic_encode(prompt))
+        elif self.is_anthropic:
+            from anthropic import Anthropic
+            client = Anthropic()
+            return client.count_tokens(prompt)
+        elif self.is_google:
+            return self.tokenizer(prompt)
+        elif self.is_hf:
+            return len(self.tokenizer.encode(prompt))
         num_tokens = len(self.encode(prompt)['input_ids'])
         return num_tokens
+
+    def heuristic_encode(self, text: str) -> list:
+        """
+        A heuristic-based approach to estimate token counts.
+        """
+        total_tokens = len(text) // 4 if len(text) >= 4 else 1
+        return [0] * total_tokens
 
     def __call__(self, x, *args, **kwargs):
         return self.encode(x, *args, **kwargs)
@@ -1165,33 +1452,166 @@ try:
 except (PackageNotFoundError, AssertionError):
     have_jq = False
 
+try:
+    assert distribution('optimum') is not None
+    have_optimum = True
+except (PackageNotFoundError, AssertionError):
+    have_optimum = False
+
+try:
+    assert distribution('librosa') is not None
+    have_librosa = True
+except (PackageNotFoundError, AssertionError):
+    have_librosa = False
+
+try:
+    assert distribution('wavio') is not None
+    have_wavio = True
+except (PackageNotFoundError, AssertionError):
+    have_wavio = False
+
+try:
+    assert distribution('soundfile') is not None
+    have_soundfile = True
+except (PackageNotFoundError, AssertionError):
+    have_soundfile = False
+
+try:
+    assert distribution('deepspeed') is not None
+    have_deepspeed = True
+except (PackageNotFoundError, AssertionError):
+    have_deepspeed = False
+
+try:
+    assert distribution('emoji') is not None
+    have_emoji = True
+except (PackageNotFoundError, AssertionError):
+    have_emoji = False
+
+try:
+    assert distribution('langid') is not None
+    have_langid = True
+except (PackageNotFoundError, AssertionError):
+    have_langid = False
+
+try:
+    assert distribution('TTS') is not None
+    have_TTS = True
+except (PackageNotFoundError, AssertionError):
+    have_TTS = False
+
+try:
+    assert distribution('faster_whisper') is not None
+    have_use_faster = True
+except (PackageNotFoundError, AssertionError):
+    have_use_faster = False
+
+try:
+    assert distribution('flash_attn') is not None
+    have_flash_attention = True
+    have_flash_attention_2 = distribution('flash_attn').version.startswith('2.')
+except (PackageNotFoundError, AssertionError):
+    have_flash_attention = False
+    have_flash_attention_2 = False
+
+try:
+    assert distribution('gradio') is not None
+    have_gradio = True
+    is_gradio_version4 = distribution('gradio').version.startswith('4.')
+except (PackageNotFoundError, AssertionError):
+    have_gradio = False
+    is_gradio_version4 = False
+
+try:
+    assert distribution('gradio_pdf') is not None
+    have_gradio_pdf = is_gradio_version4
+except (PackageNotFoundError, AssertionError):
+    have_gradio_pdf = False
+
+try:
+    assert distribution('pyrubberband') is not None
+    have_pyrubberband = True
+except (PackageNotFoundError, AssertionError):
+    have_pyrubberband = False
+
+try:
+    assert distribution('fiftyone') is not None
+    have_fiftyone = True
+except (PackageNotFoundError, AssertionError):
+    have_fiftyone = False
+
+try:
+    assert distribution('diffusers') is not None
+    have_diffusers = True
+except (PackageNotFoundError, AssertionError):
+    have_diffusers = False
+
+try:
+    assert distribution('opencv-python-headless') is not None
+    have_cv2 = True
+except (PackageNotFoundError, AssertionError):
+    try:
+        assert distribution('opencv-python') is not None
+        have_cv2 = True
+    except (PackageNotFoundError, AssertionError):
+        have_cv2 = False
+
 only_unstructured_urls = os.environ.get("ONLY_UNSTRUCTURED_URLS", "0") == "1"
 only_selenium = os.environ.get("ONLY_SELENIUM", "0") == "1"
 only_playwright = os.environ.get("ONLY_PLAYWRIGHT", "0") == "1"
 
 
-def set_openai(inference_server):
-    if inference_server.startswith('vllm'):
-        import openvllm
-        openvllm.api_key = "EMPTY"
+def set_openai(inference_server, model_name=None):
+    if inference_server.startswith('sglang'):
+        inference_server_split = inference_server.split(':')
+        inference_server_split[1] = None
+        inference_server = ':'.join([x for x in inference_server_split if x is not None])
+    if inference_server.startswith('vllm') or inference_server.startswith('sglang'):
+        api_key = "EMPTY"
         inf_type = inference_server.split(':')[0].strip()
-        ip_port_vllm = ':'.join(inference_server.split(':')[1:])
-        if ip_port_vllm.startswith('https://') or ip_port_vllm.startswith('http://'):
-            openvllm.api_base = ip_port_vllm
+        ip_port = ':'.join(inference_server.split(':')[1:])
+        if ip_port.startswith('https://'):
+            http_prefix = 'https://'
+            ip_port = ip_port[len(http_prefix):]
+            auto_v1 = False
+        elif ip_port.startswith('http://'):
+            http_prefix = 'http://'
+            ip_port = ip_port[len(http_prefix):]
+            auto_v1 = False
         else:
-            ip_vllm = inference_server.split(':')[1].strip()
-            port_vllm = inference_server.split(':')[2].strip()
-            openvllm.api_base = f"http://{ip_vllm}:{port_vllm}/v1"
-        return openvllm, inf_type, None, None, None, openvllm.api_key
-    else:
-        import openai
-        openai.api_key = os.getenv("OPENAI_API_KEY")
-        openai.api_base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
+            http_prefix = 'http://'
+            auto_v1 = True
+        if inference_server.startswith('sglang') and '/v1' not in inference_server:
+            auto_v1 = True
 
+        address = ':'.join(ip_port.split(':')[0:1]).strip()
+        api_base = http_prefix + address
+        if len(ip_port.split(':')) >= 2:
+            port = ip_port.split(':')[1].strip()
+            if port not in [None, 'None']:
+                api_base += ':' + port
+        if len(ip_port.split(':')) >= 3:
+            # if not there, use EMPTY as default
+            url_path = ip_port.split(':')[2].strip()
+            if url_path not in [None, 'None']:
+                api_base += url_path  # assume includes prefix of / and /v1
+        if auto_v1 and not api_base.endswith('/v1'):
+            api_base += '/v1'
+        if len(ip_port.split(':')) >= 4:
+            # if not there, use EMPTY as default
+            api_key = ip_port.split(':')[3].strip()
+
+        from openai import OpenAI, AsyncOpenAI
+        client_args = dict(base_url=api_base, api_key=api_key)
+        client = OpenAI(**client_args)
+        async_client = AsyncOpenAI(**client_args)
+
+        return client, async_client, inf_type, None, api_base, None, api_key
+    else:
+        api_key = os.getenv("OPENAI_API_KEY")
         base_url = None
         deployment_type = None
         api_version = None
-        api_key = openai.api_key
         inf_type = inference_server.split(':')[0].strip()
         if len(inference_server.split(':')) >= 2:
             deployment_type = inference_server.split(':')[1].strip()
@@ -1203,14 +1623,19 @@ def set_openai(inference_server):
         if inference_server.startswith('openai_azure'):
             if api_version in ['None', None]:
                 # for function tools support
-                api_version = "2023-10-01-preview"
+                # https://github.com/Azure/azure-rest-api-specs/tree/main/specification/cognitiveservices/data-plane/AzureOpenAI/inference/preview/2023-12-01-preview
+                # https://learn.microsoft.com/en-us/azure/ai-services/openai/api-version-deprecation
+                api_version = "2024-05-01-preview"
             if os.getenv('OPENAI_AZURE_KEY') is not None:
                 # use this instead if exists
-                openai.api_key = api_key = os.getenv('OPENAI_AZURE_KEY')
+                api_key = os.getenv("OPENAI_AZURE_KEY")
+        elif api_version in ['None', None]:
+            api_version = None
+
         if len(inference_server.split(':')) >= 5:
             api_key0 = inference_server.split(':')[4].strip()
             if api_key0 not in ['None', None]:
-                openai.api_key = api_key = api_key0
+                api_key = api_key0
 
         if deployment_type == 'None':
             deployment_type = None
@@ -1218,7 +1643,28 @@ def set_openai(inference_server):
             base_url = None
         if base_url == 'None':
             base_url = None
-        return openai, inf_type, deployment_type, base_url, api_version, api_key
+
+        # cannot use non-chat model, uses old openai. stuff if go through to H2OOpenAI with chat model
+        if model_name:
+            chat_model = (model_name.startswith("gpt-3.5-turbo") or model_name.startswith(
+                "gpt-4")) and "-instruct" not in model_name
+            if chat_model and inf_type == 'openai_azure':
+                inf_type = 'openai_azure_chat'
+            if chat_model and inf_type == 'openai':
+                inf_type = 'openai_chat'
+
+        from openai import OpenAI, AzureOpenAI, AsyncOpenAI, AsyncAzureOpenAI
+        if inf_type in ['openai_azure', 'openai_azure_chat']:
+            client_args = dict(azure_deployment=deployment_type, azure_endpoint=base_url, api_version=api_version,
+                               api_key=api_key)
+            client = AzureOpenAI(**client_args)
+            async_client = AsyncAzureOpenAI(**client_args)
+        else:
+            client_args = dict(base_url=base_url, api_key=api_key)
+            client = OpenAI(**client_args)
+            async_client = AsyncOpenAI(**client_args)
+
+        return client, async_client, inf_type, deployment_type, base_url, api_version, api_key
 
 
 def get_list_or_str(x):
@@ -1249,18 +1695,48 @@ def deepcopy_by_pickle_object(object):
 
 
 def url_alive(url):
+    if not isinstance(url, str):
+        return False
     try:
         response = requests.head(url)
     except Exception as e:
         return False
     else:
-        if response.status_code in [200, 301, 302]:
+        if response.status_code in [200, 301, 302, 307]:
             return True
         else:
             return False
 
 
+def return_good_url(url):
+    # ignore status code, just see if exists or not
+    for prefix in ['', 'https://', 'http://', 'https://www.', 'http://www.']:
+        try:
+            url_test = prefix + url
+            response = requests.head(url_test, timeout=10)
+        except requests.exceptions.Timeout as e:
+            response = None
+            url_test = None
+        except Exception as e:
+            response = None
+            url_test = None
+        if response is not None:
+            # and response.status_code < 400:
+            # don't do status check, if got status, then is real URL regardless of goodness, not text
+            return url_test
+    return None
+
+
+def is_probably_url(url):
+    if not isinstance(url, str):
+        return False
+    # url_alive too slow
+    return any(url.startswith(prefix) for prefix in ['www.', 'http://', 'https://', 'https://www.', 'http://www.'])
+
+
 def dict_to_html(x, small=True, api=False):
+    x = {k: v if not in_gradio_root(v) and not is_probably_url(v) else get_url(v, from_str=True, short_name=True) for
+         k, v in x.items()}
     df = pd.DataFrame(x.items(), columns=['Key', 'Value'])
     df.index = df.index + 1
     df.index.name = 'index'
@@ -1272,6 +1748,12 @@ def dict_to_html(x, small=True, api=False):
             return "<small>" + res + "</small>"
         else:
             return res
+
+
+def split_into_sentences(text):
+    # Split text by specified punctuation followed by space or end of text
+    sentences = re.split(r'(?<=[.!?]) +', text)
+    return sentences
 
 
 def text_to_html(x, api=False):
@@ -1287,11 +1769,11 @@ def text_to_html(x, api=False):
         white-space: -o-pre-wrap;
         word-wrap: break-word;
       }
-    </style>
+</style>
 <pre>
 %s
 </pre>
-""" % x
+""" % '<br>'.join(split_into_sentences(x))
 
 
 def lg_to_gr(
@@ -1302,39 +1784,69 @@ def lg_to_gr(
     n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     n_gpus, _ = cuda_vis_check(n_gpus)
 
-    image_loaders_options = ['Caption']
+    image_audio_loaders_options = ['Caption']
     if n_gpus != 0:
-        image_loaders_options.extend(['CaptionBlip2', 'Pix2Struct'])
+        image_audio_loaders_options.extend(['CaptionBlip2', 'Pix2Struct'])
     if have_tesseract:
-        image_loaders_options.append('OCR')
+        image_audio_loaders_options.append('OCR')
     if have_doctr:
-        image_loaders_options.append('DocTR')
+        image_audio_loaders_options.append('DocTR')
+    if have_librosa:
+        image_audio_loaders_options.append('ASR')
+        if n_gpus != 0:
+            image_audio_loaders_options.append('ASRLarge')
+    if kwargs['enable_llava'] and kwargs['llava_model']:
+        image_audio_loaders_options.append('LLaVa')
 
-    image_loaders_options0 = []
+    image_audio_loaders_options0 = []
     if have_tesseract and kwargs['enable_ocr']:
-        image_loaders_options0.append('OCR')
+        image_audio_loaders_options0.append('OCR')
     if have_doctr and kwargs['enable_doctr']:
-        image_loaders_options0.append('DocTR')
+        image_audio_loaders_options0.append('DocTR')
     if kwargs['enable_captions']:
         if kwargs['max_quality'] and n_gpus > 0:
             # BLIP2 only on GPU
-            image_loaders_options0.append('CaptionBlip2')
+            image_audio_loaders_options0.append('CaptionBlip2')
         else:
-            image_loaders_options0.append('Caption')
+            image_audio_loaders_options0.append('Caption')
+    if have_librosa and kwargs['enable_transcriptions']:
+        if kwargs['max_quality'] and n_gpus > 0:
+            image_audio_loaders_options0.append('ASRLarge')
+        else:
+            image_audio_loaders_options0.append('ASR')
+    if kwargs['enable_llava'] and kwargs['llava_model']:
+        #  and n_gpus > 0  # don't require local GPUs
+        # LLaVa better and faster if present
+        #  and kwargs['max_quality']
+        image_audio_loaders_options0.append('LLaVa')
+        if 'Caption' in image_audio_loaders_options0:
+            image_audio_loaders_options0.remove('Caption')
+        if 'CaptionBlip2' in image_audio_loaders_options0:
+            image_audio_loaders_options0.remove('CaptionBlip2')
 
-    pdf_loaders_options = ['PyMuPDF', 'Unstructured', 'PyPDF', 'TryHTML']
+    pdf_loaders_options = ['Unstructured', 'PyPDF', 'TryHTML']
+    if have_pymupdf:
+        pdf_loaders_options = ['PyMuPDF'] + pdf_loaders_options
     if have_tesseract:
         pdf_loaders_options.append('OCR')
     if have_doctr:
         pdf_loaders_options.append('DocTR')
 
     pdf_loaders_options0 = []
-    if kwargs['use_pymupdf'] in [True, 'auto', 'on']:
+    if have_pymupdf and kwargs['use_pymupdf'] in [True, 'auto', 'on']:
         pdf_loaders_options0.append('PyMuPDF')
     if kwargs['enable_pdf_ocr'] in [True, 'on']:
         pdf_loaders_options0.append('OCR')
     if have_doctr and kwargs['enable_pdf_doctr'] in [True, 'on']:
         pdf_loaders_options0.append('DocTR')
+    # in case my pymupdf, use pypdf as backup default
+    if kwargs['use_pypdf'] in [True, 'on'] and have_pymupdf or kwargs['use_pypdf'] in [True, 'auto',
+                                                                                       'on'] and not have_pymupdf:
+        pdf_loaders_options0.append('PyPDF')
+    if kwargs['use_unstructured_pdf'] in [True, 'on']:
+        pdf_loaders_options0.append('Unstructured')
+    if kwargs['try_pdf_as_html'] in [True, 'on']:
+        pdf_loaders_options0.append('TryHTML')
 
     url_loaders_options = []
     if only_unstructured_urls:
@@ -1349,13 +1861,18 @@ def lg_to_gr(
             url_loaders_options.append('Selenium')
         if have_playwright:
             url_loaders_options.append('PlayWright')
+            url_loaders_options.append('ScrapeWithPlayWright')
+        url_loaders_options.append('ScrapeWithHttp')
     url_loaders_options0 = [url_loaders_options[0]]
 
-    assert set(image_loaders_options0).issubset(image_loaders_options)
-    assert set(pdf_loaders_options0).issubset(pdf_loaders_options)
-    assert set(url_loaders_options0).issubset(url_loaders_options)
+    assert set(image_audio_loaders_options0).issubset(image_audio_loaders_options), "%s %s" % (
+        image_audio_loaders_options0, image_audio_loaders_options)
+    assert set(pdf_loaders_options0).issubset(pdf_loaders_options), "%s %s" % (
+        pdf_loaders_options0, pdf_loaders_options)
+    assert set(url_loaders_options0).issubset(url_loaders_options), "%s %s" % (
+        url_loaders_options0, url_loaders_options)
 
-    return image_loaders_options0, image_loaders_options, \
+    return image_audio_loaders_options0, image_audio_loaders_options, \
         pdf_loaders_options0, pdf_loaders_options, \
         url_loaders_options0, url_loaders_options
 
@@ -1501,7 +2018,11 @@ def str_to_list(x, allow_none=False):
     if isinstance(x, str):
         if len(x.strip()) > 0:
             if x.strip().startswith('['):
-                x = ast.literal_eval(x.strip())
+                try:
+                    x = ast.literal_eval(x.strip())
+                except Exception:
+                    print("bad x: %s" % x, flush=True)
+                    raise
             else:
                 raise ValueError("Invalid str_to_list for %s" % x)
         else:
@@ -1530,21 +2051,30 @@ def str_to_dict(x):
     return x
 
 
-def get_token_count(x, tokenizer, token_count_fun=None):
+def get_token_count(x, tokenizer, token_count_fun=None, add_special_tokens=True):
     # NOTE: Somewhat duplicates H2OTextGenerationPipeline.get_token_count()
     # handle ambiguity in if get dict or list
-    if tokenizer:
+    other_kwargs = dict(add_special_tokens=add_special_tokens) if hasattr(tokenizer, 'add_special_tokens') else {}
+    if tokenizer is not None:
         if hasattr(tokenizer, 'encode'):
-            template_tokens = tokenizer.encode(x)
+            tokens = tokenizer.encode(x, **other_kwargs)
         else:
-            template_tokens = tokenizer(x)
-        if isinstance(template_tokens, dict) and 'input_ids' in template_tokens:
-            n_tokens = len(tokenizer.encode(x)['input_ids'])
+            tokens = tokenizer(x, **other_kwargs)
+        if isinstance(tokens, dict) and 'input_ids' in tokens:
+            tokens = tokens['input_ids']
+        if isinstance(tokens, list):
+            n_tokens = len(tokens)
+        elif len(tokens.shape) == 2:
+            n_tokens = tokens.shape[1]
+        elif len(tokens.shape) == 1:
+            n_tokens = tokens.shape[0]
         else:
-            n_tokens = len(tokenizer.encode(x))
+            raise RuntimeError("Cannot handle tokens: %s" % tokens)
     elif token_count_fun is not None:
         assert callable(token_count_fun)
-        n_tokens = token_count_fun(x)
+        other_kwargs = dict(add_special_tokens=add_special_tokens) if hasattr(token_count_fun,
+                                                                              'add_special_tokens') else {}
+        n_tokens = token_count_fun(x, **other_kwargs)
     else:
         tokenizer = FakeTokenizer()
         n_tokens = tokenizer.num_tokens_from_string(x)
@@ -1613,3 +2143,484 @@ def get_test_name_core():
     tn = os.environ['PYTEST_CURRENT_TEST'].split(':')[-1]
     tn = "_".join(tn.split(' ')[:-1])  # skip (call) at end
     return sanitize_filename(tn)
+
+
+class FullSet(set):
+    def __contains__(self, item):
+        return True
+
+
+import os
+
+
+def create_relative_symlink(target, link_name):
+    """
+    Creates a relative symlink to a target from a link location, ensuring parent directories exist.
+    The target can be either a file or a directory.
+
+    Parameters:
+    - target: The path to the target file or directory. This can be an absolute or a relative path.
+    - link_name: The path where the symlink will be created. This should include the name of the symlink itself.
+
+    Raises:
+    - ValueError: If the target does not exist.
+    """
+    # Ensure the target exists
+    if not os.path.exists(target):
+        raise ValueError("Target does not exist: " + target)
+
+    # Calculate the absolute paths
+    target_abs = os.path.abspath(target)
+    link_dir = os.path.dirname(os.path.abspath(link_name))
+
+    # Ensure the parent directory of the link exists
+    os.makedirs(link_dir, exist_ok=True)
+
+    # Calculate the relative path for the symlink
+    relative_path = os.path.relpath(target_abs, link_dir)
+
+    # Remove the link if it already exists
+    if os.path.exists(link_name) or os.path.islink(link_name):
+        os.remove(link_name)
+
+    # Create the symlink
+    os.symlink(relative_path, link_name)
+    print(f"Symlink created: {link_name} -> {relative_path}")
+
+
+def get_gradio_tmp():
+    gradio_tmp = '/tmp/gradio'
+    makedirs(gradio_tmp, exist_ok=True)  # won't hurt if soft link if exists
+    gradio_tmp = os.path.realpath(gradio_tmp)
+    return gradio_tmp
+
+
+def in_gradio_root(file):
+    ret = False
+    ret |= isinstance(file, str) and os.path.isfile(file) and os.path.abspath(file).startswith('/tmp/gradio')
+    ret |= isinstance(file, str) and os.path.isfile(file) and os.path.abspath(file).startswith(get_gradio_tmp())
+    return ret
+
+
+def get_is_gradio_h2oai():
+    try:
+        import gradio as gr
+        return gr.__h2oai__
+    except:
+        return False
+
+
+def split_list(input_list, split_size):
+    for i in range(0, len(input_list), split_size):
+        yield input_list[i:i + split_size]
+
+
+def get_lock_file(name):
+    lock_type = name
+    base_path = os.path.join('locks', '%s_locks' % name)
+    base_path = makedirs(base_path, exist_ok=True, tmp_ok=True, use_base=True)
+    lock_file = os.path.join(base_path, "%s.lock" % lock_type)
+    makedirs(os.path.dirname(lock_file))  # ensure made
+    return lock_file
+
+
+def merge_dict(dict1, dict2):
+    ret = dict1.copy()
+    ret.update(dict2)
+    return ret
+
+
+def is_uuid4(string):
+    # Regular expression to match the UUID v4 format
+    pattern = re.compile(r'^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$', re.IGNORECASE)
+    return bool(pattern.match(string))
+
+
+def is_full_git_hash(s):
+    # This regex checks for exactly 40 hexadecimal characters.
+    return bool(re.fullmatch(r'[0-9a-f]{40}', s))
+
+
+def get_show_username(username1):
+    if split_google in username1:
+        show_username = split_google.join(username1.split(split_google)[0:1])
+    else:
+        show_username = username1
+    return show_username
+
+
+# for extracting code blocks
+pattern = re.compile(r"```(.*?)(\n[\s\S]*?)?```", re.DOTALL)
+
+
+def get_code_blocks(response):
+    return pattern.findall(response)
+
+
+def get_json(response, fixup=True, json_schema_type=None):
+    is_list = isinstance(response, list)
+    if not is_list:
+        response = [response]
+    response_new = [_get_json(x, fixup=fixup, json_schema_type=json_schema_type) for x in response]
+    if not is_list:
+        response_new = response_new[0]
+    return response_new
+
+
+def extract_values(data):
+    if isinstance(data, dict):
+        if 'type' in data and 'value' in data:
+            return data['value']
+        elif 'items' in data:
+            return [extract_values(item) for item in data['items']]
+        elif 'properties' in data:
+            return {key: extract_values(value) for key, value in data['properties'].items()}
+        elif 'enum' in data:
+            return data['enum']  # return the enum values
+        elif 'const' in data:
+            return data['const']  # return the const value
+        elif 'oneOf' in data:
+            return [extract_values(item) for item in data['oneOf']]
+        elif 'anyOf' in data:
+            return [extract_values(item) for item in data['anyOf']]
+        elif 'allOf' in data:
+            return [extract_values(item) for item in data['allOf']]
+        else:
+            return {key: extract_values(value) for key, value in data.items()}
+    elif isinstance(data, list):
+        return [extract_values(item) for item in data]
+    else:
+        return data
+
+
+# Function to check if JSON contains schema information
+def contains_schema(data):
+    if isinstance(data, dict):
+        if 'type' in data and 'value' in data:
+            return True
+        for key, value in data.items():
+            if contains_schema(value):
+                return True
+    elif isinstance(data, list):
+        for item in data:
+            if contains_schema(item):
+                return True
+    return False
+
+
+# Main function to handle both schema and regular JSON
+def handle_json(data):
+    if contains_schema(data):
+        return extract_values(data)
+    else:
+        return data
+
+
+def repair_json_by_type(response, json_schema_type=None):
+    # WIP for later
+    if json_schema_type == 'object':
+        from json_repair import repair_json
+        response = repair_json(response)
+        try:
+            # assumes already dict
+            return json.dumps(handle_json(json.loads(response)))
+        except Exception as e:
+            print("Did not extract_values: %s" % str(e))
+            return response
+    else:
+        from json_repair import repair_json
+        return repair_json(response)
+
+
+def _get_json(response, fixup=True, json_schema_type=None):
+    if fixup:
+        # first rely upon json_repair package, handles code block extraction as well automatically
+        try:
+            response0 = repair_json_by_type(response, json_schema_type=json_schema_type)
+            if response0:
+                return response0
+        except Exception as e:
+            # FIXME: best effort, don't understand if package will hae issues
+            print("repair_json exception1: %s: %s" % (str(e), response))
+
+    # if json_repair fails, try to extract code block content
+    # sIf content is found (not an empty string), return None (or possibly an empty string as per updated logic)
+    response0 = extract_code_block_content(response)
+    if response0:
+        if fixup:
+            try:
+                response0 = repair_json_by_type(response0, json_schema_type=json_schema_type)
+            except Exception as e:
+                # FIXME: best effort, don't understand if package will hae issues
+                print("repair_json exception2: %s: %s" % (str(e), response))
+        return response0
+    # Next, check if the response looks like JSON, return it if so
+    if looks_like_json(response):
+        response = response.strip()
+        if response.endswith('```'):
+            response = response[:-3].strip()
+        if fixup:
+            try:
+                response = repair_json_by_type(response, json_schema_type=json_schema_type)
+            except Exception as e:
+                # FIXME: best effort, don't understand if package will hae issues
+                print("repair_json exception3: %s: %s" % (str(e), response))
+        return response
+    # If it doesn't look like JSON, return an empty string as a default case
+    return invalid_json_str
+
+
+# Adjusted pattern to match code block content accurately
+pattern_extract_codeblock = re.compile(r"```(?:[a-zA-Z]*)\s*(.*?)(```|$)", re.DOTALL)
+
+
+def preprocess_code_blocks(stream_content):
+    # Remove consecutive starting code block delimiters, but keep the inner content
+    stream_content = re.sub(r"```[a-zA-Z]*\n```[a-zA-Z]*", "```", stream_content)
+    # Remove consecutive ending code block delimiters
+    stream_content = re.sub(r"```\n```", "```", stream_content)
+    return stream_content
+
+
+def extract_code_block_content(stream_content):
+    # Postprocess to handle nested or consecutive code block delimiters
+    stream_content = preprocess_code_blocks(stream_content)
+
+    match = pattern_extract_codeblock.search(stream_content)
+    if match:
+        return match.group(1).strip()
+    else:
+        return ''
+
+
+def has_starting_code_block(text):
+    pattern_partial_codeblock = re.compile(r"(^|\n|\r|<br\s*/?>)\s*```")
+    return bool(pattern_partial_codeblock.search(text))
+
+
+def looks_like_json(text):
+    # Strip leading whitespace and check the first non-whitespace character
+    stripped_text = text.lstrip()
+
+    # Check if the text starts with '{', '[', or potentially a JSON string
+    if stripped_text.startswith(('{', '[', '"')):
+        return True
+
+    # Optionally, check for simple numeric values or null, true, false which are valid JSON
+    if re.match(r'(-?\d+(\.\d+)?([eE][+-]?\d+)?|null|true|false)\s*($|[,\]}])', stripped_text):
+        return True
+
+    return False
+
+
+def is_json_vllm(model, base_model, inference_server, verbose=False):
+    if inference_server and not inference_server.startswith('vllm') or not inference_server:
+        return False
+
+    if isinstance(model, dict) and 'client' in model:
+        openai_client = model['client']
+    else:
+        openai_client, _, _, _, _, _, _ = set_openai(inference_server, model_name=base_model)
+
+    vllm_version = get_vllm_version(openai_client, inference_server, verbose=verbose)
+    json_vllm_version = "0.4.0"  # The version to compare against
+
+    # Parse the version strings into comparable objects
+    parsed_vllm_version = version.parse(vllm_version)
+    parsed_json_vllm_version = version.parse(json_vllm_version)
+
+    # Compare the versions
+    if parsed_vllm_version >= parsed_json_vllm_version:
+        return True
+    else:
+        return False
+
+
+def get_vllm_version(openai_client, inference_server, verbose=False):
+    vllm_version = '0.3.0'
+    if inference_server.startswith('vllm'):
+        # https://github.com/vllm-project/vllm/blob/main/vllm/entrypoints/openai/api_server.py
+        parsed_url = str(openai_client.base_url).replace("/v1", "/version")
+        try:
+            response = requests.get(parsed_url, timeout=int(os.getenv('REQUEST_TIMEOUT', '30')))
+            if response.status_code == 200:
+                # Parsing the JSON response content to a dictionary
+                data = response.json()
+                # Accessing the version from the response
+                vllm_version = data.get('version', vllm_version)
+                if verbose:
+                    print(f"vLLM Server version: {vllm_version}")
+            else:
+                if verbose:
+                    print(f"Failed to retrieve version, status code: {response.status_code}")
+        except (requests.exceptions.Timeout, requests.exceptions.JSONDecodeError):
+            # if times out, assume older version, with no JSON.  Or might not be real vllm
+            vllm_version = '0.3.0'
+            print(f"vLLM Server version timeout, assuming: {vllm_version}")
+    return vllm_version
+
+
+def get_docs_tokens(tokenizer, text_context_list=[], max_input_tokens=None, docs_joiner=docs_joiner_default):
+    """
+    max_input_tokens: Over all LLM calls, upper limit of total token count,
+                      or single LLM call if want to know what docs fit into single call
+    """
+    if text_context_list is None or len(text_context_list) == 0:
+        return 0, None, 0
+    assert max_input_tokens is not None, "Must set max_input_tokens"
+    tokens = [get_token_count(x + docs_joiner, tokenizer) for x in text_context_list]
+    tokens_cumsum = np.cumsum(tokens)
+    where_res = np.where(tokens_cumsum <= max_input_tokens)[0]
+    # if below condition fails, then keep top_k_docs=-1 and trigger special handling next
+    if where_res.shape[0] > 0:
+        top_k_docs = 1 + where_res[-1]
+        one_doc_size = None
+        num_doc_tokens = tokens_cumsum[top_k_docs - 1]  # by index
+    else:
+        # if here, means 0 and just do best with 1 doc
+        top_k_docs = 1
+        text_context_list = text_context_list[:top_k_docs]
+        # critical protection
+        from src.h2oai_pipeline import H2OTextGenerationPipeline
+        doc_content = text_context_list[0]
+        doc_content, new_tokens0 = H2OTextGenerationPipeline.limit_prompt(doc_content,
+                                                                          tokenizer,
+                                                                          max_prompt_length=max_input_tokens)
+        text_context_list[0] = doc_content
+        one_doc_size = len(doc_content)
+        num_doc_tokens = get_token_count(doc_content + docs_joiner, tokenizer)
+        print(
+            "Unexpected large chunks and can't add to context, will add 1 anyways.  Tokens %s -> %s for max_input_tokens=%s" % (
+                tokens[0], new_tokens0, max_input_tokens), flush=True)
+    return top_k_docs, one_doc_size, num_doc_tokens
+
+
+def get_limited_text(hard_limit_tokens, text, tokenizer, verbose=False):
+    if tokenizer is None:
+        return text[:4 * hard_limit_tokens]
+
+    low = 0
+    high = len(text)
+    best_guess = text  # Initialize best_guess to ensure it's defined
+    ntokens0 = len(tokenizer.tokenize(best_guess))
+    ntokens = None
+
+    max_steps = 5
+    steps = 0
+    while low <= high:
+        mid = low + (high - low) // 2  # Calculate midpoint for current search interval
+        # Estimate a trial cut of the text based on mid
+        trial_text_length = max(int(mid * 4), 1)  # Using mid * 4 as an estimation, ensuring at least 1 character
+        trial_text = text[-trial_text_length:]  # Take text from the end, based on trial_text_length
+
+        # Tokenize the trial text and count tokens
+        ntokens = len(tokenizer.tokenize(trial_text))
+
+        if ntokens > hard_limit_tokens:
+            # If the trial exceeds the token limit, reduce 'high' to exclude the current trial length
+            high = mid - 1
+        else:
+            # If the trial does not exceed the token limit, update 'best_guess' and increase 'low'
+            best_guess = trial_text  # Update best_guess with the current trial_text
+            low = mid + 1  # Attempt to include more text in the next trial
+            if steps >= max_steps:
+                break
+        steps += 1
+
+    # 'best_guess' now contains the text that best fits the criteria
+    if verbose:
+        print("steps: %s ntokens0: %s/%s text0: %s ntokens: %s/%s text: %s" % (
+            steps, ntokens0, hard_limit_tokens, len(text), ntokens, hard_limit_tokens, len(best_guess)))
+    return best_guess
+
+
+def deduplicate_names(names):
+    # Dictionary to hold the counts of each name
+    name_counts = {}
+    # List to store the final results
+    deduplicated_names = []
+
+    for name in names:
+        # Check if the name already exists in the dictionary
+        if name in name_counts:
+            # Increment the count for this name
+            name_counts[name] += 1
+            # Append the new name with the count as a suffix
+            deduplicated_names.append(f"{name}_{name_counts[name]}")
+        else:
+            # Add the name to the dictionary with a count of 0
+            name_counts[name] = 0
+            # Append the name as it is the first occurrence
+            deduplicated_names.append(name)
+
+    return deduplicated_names
+
+
+def download_image(image_url, save_dir):
+    """
+    Download an image from a URL and save it to a specified directory.
+
+    Parameters:
+    image_url (str): The URL of the image to download.
+    save_dir (str): The directory path where the image will be saved.
+
+    Returns:
+    str or None: The file path where the image was saved, or None if an error occurred.
+    """
+    try:
+        response = requests.get(image_url)
+        response.raise_for_status()  # Check if the request was successful
+
+        # Extract the file name from the URL
+        parsed_url = urlparse(image_url)
+        file_name = os.path.basename(parsed_url.path)
+
+        # Create the full save path
+        save_path = os.path.join(save_dir, file_name)
+        makedirs(save_dir, exist_ok=True)
+
+        # Save the image
+        with open(save_path, 'wb') as file:
+            file.write(response.content)
+        return save_path
+    except requests.exceptions.RequestException as e:
+        print(f"Error downloading the image: {e}")
+        return None
+
+
+# Check if the input is a URL
+url_pattern = re.compile(
+    r'^(?:http|ftp)s?://'  # http:// or https://
+    r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|'  # domain...
+    r'localhost|'  # localhost...
+    r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|'  # ...or ipv4
+    r'\[?[A-F0-9]*:[A-F0-9:]+\]?)'  # ...or ipv6
+    r'(?::\d+)?'  # optional port
+    r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+
+
+def check_input_type(input_string):
+    """
+    Check if the input string is a file path, URL, or a base64 encoded image.
+
+    Parameters:
+    input_string (str): The input string to check.
+
+    Returns:
+    str: 'file', 'url', 'base64', or 'unknown' based on the input type.
+    """
+    if not isinstance(input_string, str):
+        return 'unknown'
+
+    # Check if the input string looks like a base64 encoded image
+    if input_string.startswith("data:image/") or input_string.startswith("b'data:image/"):
+        return 'base64'
+
+    if re.match(url_pattern, input_string):
+        return 'url'
+
+    # Check if the input is a file path
+    if os.path.isfile(input_string):
+        return 'file'
+
+    return 'unknown'
