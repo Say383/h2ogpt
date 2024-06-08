@@ -1,12 +1,50 @@
-# Offline Mode:
+# Offline Mode and Security:
 
-## Easy Way:
+## TL;DR
+
+To run offline, either do smart or manual way.
+
+* Smart Download
+    1) Run online with command that downloads the model for you (i.e. using HF link name, not file name)
+    2) Go offline and run using the file directly or use UI to select the model
+E.g.
+```bash
+# online do:
+python generate.py --base_model=TheBloke/zephyr-7B-beta-GGUF --prompt_type=zephyr --max_seq_len=4096 --add_disk_models_to_ui=False
+# Then use h2oGPT as might normally for any tasks.
+# Once offline do:
+TRANSFORMERS_OFFLINE=1 python generate.py --base_model=zephyr-7b-beta.Q5_K_M.gguf --prompt_type=zephyr --gradio_offline_level=2 --share=False --add_disk_models_to_ui=False
+# or:
+TRANSFORMERS_OFFLINE=1 python generate.py --base_model=llama --model_path_llama=zephyr-7b-beta.Q5_K_M.gguf --prompt_type=zephyr --gradio_offline_level=2 --share=False --add_disk_models_to_ui=False
+# or if choosing in UI do (be sure to choose correct prompt_type too):
+TRANSFORMERS_OFFLINE=1 python generate.py --gradio_offline_level=2 --share=False --add_disk_models_to_ui=False
+```
+
+* Manual Download
+    1) Download the model file you want and place into llamacpp_path (i.e. downloading url to local file)
+    2) Go offline and run using the file directly or use UI to select the model
+
+```bash
+# online do:
+wget https://huggingface.co/TheBloke/zephyr-7B-beta-GGUF/resolve/main/zephyr-7b-beta.Q5_K_M.gguf?download=true -O llamacpp_path/zephyr-7b-beta.Q5_K_M.gguf
+# Then use normally for any tasks one expects to do offline.
+# Once offline do:
+TRANSFORMERS_OFFLINE=1 python generate.py --base_model=zephyr-7b-beta.Q5_K_M.gguf --prompt_type=zephyr --gradio_offline_level=2 --share=False --add_disk_models_to_ui=False
+# or:
+TRANSFORMERS_OFFLINE=1 python generate.py --base_model=llama --model_path_llama=zephyr-7b-beta.Q5_K_M.gguf --prompt_type=zephyr --gradio_offline_level=2 --share=False --add_disk_models_to_ui=False
+# or if choosing in UI do (be sure to choose correct prompt_type too):
+TRANSFORMERS_OFFLINE=1 python generate.py --gradio_offline_level=2 --share=False --add_disk_models_to_ui=False
+```
+
+NOTE: If set `--prepare_offline_level=2` for first online call, h2oGPT will get standard models for offline use, but that may be more than you require.  You can tune the code `../src/prepare_offline.py` to get only the models you require.
+
+### Easy Way:
 
 Run h2oGPT as would in offline mode, ensuring to use LLM and upload docs using same parsers as would want in offline mode.  The `~/.cache` folder will be filled, and one can use that in offline mode.
 
-## Moderately Easy Way:
+### Moderately Easy Way:
 
-If you can run on same (or better) system that will be like that in offline mode, you can run the below and collect all needed items in the `~/.cache/` and `~/nltk_data` folders, specifically:
+If you can run on same (or better) system that will be like that in offline mode, you can run the following and collect all needed items in the `~/.cache/` and `~/nltk_data` folders, specifically:
 * `~/.cache/selenium/`
 * `~/.cache/huggingface/`
 * `~/.cache/torch/`
@@ -16,23 +54,23 @@ If you can run on same (or better) system that will be like that in offline mode
 * `~/.cache/ms-playwright/`
 * `~/.cache/selenium/`
 * `~/nltk_data/`
-```
-python generate.py --score_model=None --gradio_size=small --model_lock="[{'base_model': 'h2oai/h2ogpt-4096-llama2-7b-chat'}]" --save_dir=save_fastup_chat --prepare_offline_level=2
+```bash
+python generate.py --score_model=None --gradio_size=small --model_lock="[{'base_model': 'h2oai/h2ogpt-4096-llama2-7b-chat'}]" --save_dir=save_fastup_chat --prepare_offline_level=2 --add_disk_models_to_ui=False
 # below are already in docker
 python -m nltk.downloader all
 playwright install --with-deps
 ```
-Some of these locations can be controlled, but others not, so best to make local version of ~/.cache (e.g. move original out of way), run the above, archive it for offline system, restore old ~/.cache, then use offline.  If same system, then those steps aren't required, one can just go fully offline.
+Some of these locations can be controlled, but others not, so it's best to make a local version of `~/.cache` (e.g. move original out of way), run the preceding command, archive it for offline system, restore old `~/.cache`, and then use offline.  If same system, then those steps aren't required, one can just go fully offline.
 
 If you are only concerned with what h2oGPT needs, not any inference servers, you can run with `--prepare_offline_level=1` that will not obtain models associated with inference severs (e.g. vLLM or TGI).
 
 If you have a GGUF/GGML file, you should download it ahead of time and place it in some path you provide to `--llamacpp_dict` for its `model_path_llama` dict entry.
 
-## Hard Way:
+### Hard Way:
 
-Identify all models needed and download each.  The below list is not exhaustive because the models added changes frequently and each uses different approach for downloading.
+Identify and download all needed models. Note that the following list is not exhaustive because the models added change frequently and each uses a different approach for downloading.
 
-Note, when running `generate.py` and asking your first question, it will download the model(s), which for the 6.9B model takes about 15 minutes per 3 pytorch bin files if have 10MB/s download.
+Note that when running `generate.py` and asking your first question, it will download the model(s), which for the 6.9B model takes about 15 minutes per 3 pytorch bin files if have 10MB/s download.
 
 If all data has been put into `~/.cache` by HF transformers and GGUF/GGML files downloaded already and one points to them (e.g. with `--model_path_llama=llama-2-7b-chat.Q6_K.gguf` from pre-downloaded `https://huggingface.co/TheBloke/Llama-2-7b-Chat-GGUF/resolve/main/llama-2-7b-chat.Q6_K.gguf`), then these following steps (those related to downloading HF models) are not required.
 
@@ -86,7 +124,7 @@ If all data has been put into `~/.cache` by HF transformers and GGUF/GGML files 
     tokenizer.save_pretrained(model_name)
     ```
 
-## Run h2oGPT in offline mode
+### Run h2oGPT in offline mode
 
 ```bash
 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python generate.py --base_model='h2oai/h2ogpt-oasst1-512-12b' --gradio_offline_level=2 --share=False
@@ -114,7 +152,7 @@ since the mapping from that name to get file etc. is not trivial and only possib
 
 It is good idea to also set `--prompt_type`, since the version of model name given may not be in the prompt dictionary lookup.
 
-### Run vLLM offline
+#### Run vLLM offline
 
 In order to use vLLM offline, use the absolute path to the model state, which can be locally obtained model or sitting in the `.cache` folder, e.g.:
 ```bash
@@ -124,8 +162,10 @@ Otherwise, vLLM will try to contact Hugging Face servers.
 
 You can also do same for h2oGPT, but take note that if you pass absolute path for base model, you have to specify the `--prompt_type`.
 ```bash
-python generate.py --inference_server="vllm:0.0.0.0:5000" --base_model='$HOME/.cache/huggingface/hub/models--meta-llama--Llama-2-13b-chat-hf/snapshots/c2f3ec81aac798ae26dcc57799a994dfbf521496' --score_model=None --langchain_mode='UserData' --user_path=user_path --use_auth_token=True --max_seq_len=4096 --max_max_new_tokens=2048 --concurrency_count=64 --batch_size=16 --prompt_type=llama2
+python generate.py --inference_server="vllm:0.0.0.0:5000" --base_model='$HOME/.cache/huggingface/hub/models--meta-llama--Llama-2-13b-chat-hf/snapshots/c2f3ec81aac798ae26dcc57799a994dfbf521496' --score_model=None --langchain_mode='UserData' --user_path=user_path --use_auth_token=True --max_seq_len=4096 --max_max_new_tokens=2048 --concurrency_count=64 --batch_size=16 --prompt_type=llama2 --add_disk_models_to_ui=False
 ```
+
+See [README_docker](README_docker.md) for more details on running h2oGPT in offline mode for docker.
 
 ### Disable access or port
 
@@ -143,4 +183,12 @@ sed -i 's/posthog\.capture/return\n            posthog.capture/' $sp/chromadb/te
 ```
 or the equivalent for windows/mac using.  Or edit the file manually to just return in the `capture` function.
 
-To avoid h2oGPT monitoring which elements are clicked in UI, set the ENV `H2OGPT_ENABLE_HEAP_ANALYTICS=False` pass `--enable-heap-analytics=False` to `generate.py`.  Note that no data or user inputs are included, only raw svelte UI element IDs and nothing from the user inputs or data.
+This is automatically done if using `linux_install.sh` or `linux_install_full.sh`.
+
+### Disable h2oGPT telemetry
+
+To avoid h2oGPT monitoring which elements are clicked in UI, set the ENV `H2OGPT_ENABLE_HEAP_ANALYTICS=False` or pass
+```bash
+python generate.py --enable-heap-analytics=False ...
+```
+Note that no data or user inputs are included, only raw svelte UI element IDs and nothing from the user inputs or data.

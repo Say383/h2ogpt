@@ -17,14 +17,14 @@ REM * Install document question-answer dependencies
 REM     # Required for Doc Q/A: LangChain:
 CALL pip install -r reqs_optional/requirements_optional_langchain.txt -c reqs_optional/reqs_constraints.txt
 REM     # Required for CPU: LLaMa/GPT4All:
-CALL pip install -r reqs_optional/requirements_optional_gpt4all.txt -c reqs_optional/reqs_constraints.txt
+CALL pip install -r reqs_optional/requirements_optional_llamacpp_gpt4all.txt -c reqs_optional/reqs_constraints.txt --no-cache-dir
 REM     # Optional: PyMuPDF/ArXiv:
 @echo off
 IF "%GPLOK%"=="1" (
     CALL pip install -r reqs_optional/requirements_optional_langchain.gpllike.txt -c reqs_optional/reqs_constraints.txt
 )
 REM # Optional: FAISS (for AutoGPT agent)
-CALL pip install -r reqs_optional/requirements_optional_faiss_cpu.txt -c reqs_optional/reqs_constraints.txt
+CALL pip install -r reqs_optional/requirements_optional_cpu_only.txt -c reqs_optional/reqs_constraints.txt
 REM     # Optional: Selenium/PlayWright:
 CALL pip install -r reqs_optional/requirements_optional_langchain.urls.txt -c reqs_optional/reqs_constraints.txt
 REM  # Optional: for supporting unstructured package
@@ -92,8 +92,9 @@ REM     # in-transformers support of AutoGPTQ, requires also auto-gptq above to 
 CALL pip install optimum==1.16.1 -c reqs_optional/reqs_constraints.txt
 
 REM * AutoAWQ support:
-CALL pip uninstall -y autoawq
-CALL pip install autoawq==0.1.8 -c reqs_optional/reqs_constraints.txt
+CALL pip uninstall -y autoawq autoawq_kernels
+CALL pip install https://github.com/casper-hansen/AutoAWQ/releases/download/v0.1.8/autoawq-0.1.8+cu118-cp310-cp310-win_amd64.whl -c reqs_optional/reqs_constraints.txt
+CALL pip install https://github.com/casper-hansen/AutoAWQ_kernels/releases/download/v0.0.3/autoawq_kernels-0.0.3+cu118-cp310-cp310-win_amd64.whl -c reqs_optional/reqs_constraints.txt
 
 REM  Exllama support (GPU only):
 CALL pip uninstall -y exllama
@@ -105,7 +106,4 @@ REM   For more info see [SERP Docs](README_SerpAPI.md).
 
 REM * For supporting Word and Excel documents, if you don't have Word/Excel already, then download and install libreoffice: https://www.libreoffice.org/download/download-libreoffice/ .
 REM * To support OCR, download and install [tesseract](https://github.com/UB-Mannheim/tesseract/wiki), see also: [Tesseract Documentation](https://tesseract-ocr.github.io/tessdoc/Installation.html).  Please add the installation directories to your PATH.
-
-REM * PDF Viewer support (only if using gradio4):
-REM pip install https://h2o-release.s3.amazonaws.com/h2ogpt/gradio_pdf-0.0.3-py3-none-any.whl -c reqs_optional/reqs_constraints.txt
 
