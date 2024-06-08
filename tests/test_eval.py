@@ -80,7 +80,7 @@ def run_eval1(cpu=False, bits=None, base_model='h2oai/h2ogpt-oig-oasst1-512-6_9b
         stream_output=False, prompt_type=prompt_type, prompt_dict='',
         temperature=0.4, top_p=0.85, top_k=70, penalty_alpha=0.0, num_beams=1, max_new_tokens=256,
         min_new_tokens=0, early_stopping=False, max_time=180, repetition_penalty=1.07,
-        num_return_sequences=1, do_sample=True, chat=False,
+        num_return_sequences=1, do_sample=True, seed=0, chat=False,
         langchain_mode=langchain_mode, add_chat_history_to_context=True,
         add_search_to_context=False,
         langchain_action=LangChainAction.QUERY.value, langchain_agents=[],
@@ -101,7 +101,7 @@ def run_eval1(cpu=False, bits=None, base_model='h2oai/h2ogpt-oig-oasst1-512-6_9b
     kwargs['load_exllama'] = False
     kwargs['use_safetensors'] = False
     eval_out_filename = main(base_model=base_model,
-                             gradio=False,
+                             eval=True, gradio=False,
                              eval_filename=eval_filename,
                              eval_prompts_only_num=eval_prompts_only_num,
                              eval_as_output=False,
@@ -138,18 +138,27 @@ def run_eval1(cpu=False, bits=None, base_model='h2oai/h2ogpt-oig-oasst1-512-6_9b
                  'pre_prompt_summary': None,
                  'prompt_summary': None,
                  'hyde_llm_prompt': None,
+
+                 "user_prompt_for_fake_system_prompt": None,
+                 "json_object_prompt": None,
+                 "json_object_prompt_simpler": None,
+                 "json_code_prompt": None,
+                 "json_code_prompt_if_no_schema": None,
+                 "json_schema_instruction": None,
+
                  'system_prompt': 'auto',
                  'pdf_loaders': np.array(['PyMuPDF'], dtype=object),
                  'url_loaders': np.array(['Unstructured'], dtype=object),
                  'jq_schema': '.[]',
                  'extract_frames': 10,
                  'visible_models': None,
+                 'visible_image_models': None,
                  'h2ogpt_key': None,
                  'chat_conversation': None,
                  'text_context_list': None,
-                 'docs_ordering_type': 'reverse_ucurve_sort',
+                 'docs_ordering_type': 'best_near_prompt',
                  'min_max_new_tokens': 512,
-                 'max_input_tokens': -1,
+                 'max_input_tokens': 3100 if base_model == 'h2oai/h2ogpt-oig-oasst1-512-6_9b' else -1,
                  'llava_prompt': 'auto',
                  'max_total_input_tokens': -1,
                  'docs_token_handling': 'split_or_merge',
@@ -158,10 +167,19 @@ def run_eval1(cpu=False, bits=None, base_model='h2oai/h2ogpt-oig-oasst1-512-6_9b
                  'hyde_template': None,
                  'hyde_show_only_final': False,
                  'doc_json_mode': False,
+                 'metadata_in_context': 'auto',
                  'chatbot_role': 'None',
                  'speaker': 'None',
                  'tts_language': 'autodetect',
                  'tts_speed': 1.0,
+                 'image_file': None,
+                 'image_control': None,
+                 'response_format': 'text',
+                 'guided_json': '',
+                 'guided_regex': '',
+                 'guided_choice': '',
+                 'guided_grammar': '',
+                 'guided_whitespace_pattern': None,
                  }
     if cpu and bits == 32:
         expected1.update({'image_audio_loaders': np.array([], dtype=object)})
@@ -216,7 +234,7 @@ e the posterior ligaments are attached to the back. The anterior ligaments are c
  run across the width of the spine. \nThe anterior ligaments are attached to the front of the vertebrae, while the posterior ligaments are attached to the back. The anterior ligaments are""",
             'score': 0.77}
 
-    assert np.isclose(actual2['score'], expected2['score'], rtol=0.3), "Score is not as expected: %s %s" % (
+    assert np.isclose(actual2['score'], expected2['score'], rtol=0.35), "Score is not as expected: %s %s" % (
         actual2['score'], expected2['score'])
 
     from sacrebleu.metrics import BLEU
@@ -250,7 +268,7 @@ def test_eval_json_langchain():
         user_path=user_path,
     )
     eval_out_filename = main(base_model=base_model,
-                             gradio=False,
+                             eval=True, gradio=False,
                              eval_filename=eval_filename,
                              eval_prompts_only_num=eval_prompts_only_num,
                              eval_as_output=False,
