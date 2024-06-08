@@ -1,4 +1,10 @@
+import base64
+import io
+import traceback
+
 import numpy as np
+from pydub import AudioSegment
+
 from src.utils import get_device
 
 
@@ -16,8 +22,31 @@ def get_transcriber(model="openai/whisper-base.en", use_gpu=True, gpu_id='auto')
     return transcriber
 
 
+def audio_bytes_to_numpy(audio_bytes):
+    # Load the audio bytes into a BytesIO object
+    audio_stream = io.BytesIO(audio_bytes)
+
+    # Use pydub to read the audio data from the BytesIO object
+    audio = AudioSegment.from_file(audio_stream)
+
+    # Convert pydub AudioSegment to a numpy array
+    samples = np.array(audio.get_array_of_samples())
+
+    # Get the sampling rate
+    sr = audio.frame_rate
+
+    # If the audio is stereo, we need to reshape the numpy array to [n_samples, n_channels]
+    if audio.channels > 1:
+        samples = samples.reshape((-1, audio.channels))
+
+    return sr, samples
+
+
 def transcribe(audio_state1, new_chunk, transcriber=None, max_chunks=None, sst_floor=100.0, reject_no_new_text=True,
                debug=False):
+    if debug:
+        print("start transcribe", flush=True)
+
     if audio_state1[0] is None:
         audio_state1[0] = ''
     if audio_state1[2] is None:
@@ -31,13 +60,21 @@ def transcribe(audio_state1, new_chunk, transcriber=None, max_chunks=None, sst_f
         return audio_state1, audio_state1[1]
     # assume sampling rate always same
     # keep chunks so don't normalize on noise periods, which would then saturate noise with non-noise
-    sr, y = new_chunk
+    if isinstance(new_chunk, str):
+        audio_bytes = base64.b64decode(new_chunk.encode('utf-8'))
+        sr, y = audio_bytes_to_numpy(audio_bytes)
+    else:
+        sr, y = new_chunk
+
+    if debug:
+        print("post encode", flush=True)
+
     if y.shape[0] == 0:
         avg = 0.0
     else:
         # stereo to mono if needed
         if len(y.shape) > 1:
-            y = np.mean(y, dim=0)
+            y = np.mean(y, axis=0)
         avg = np.average(np.abs(y))
     if not np.isfinite(avg):
         avg = 0.0
@@ -54,17 +91,26 @@ def transcribe(audio_state1, new_chunk, transcriber=None, max_chunks=None, sst_f
         stream = stream.astype(np.float32)
         max_stream = np.max(np.abs(stream) + 1E-7)
         stream /= max_stream
+        if debug:
+            print("pre transcriber", flush=True)
         text = transcriber({"sampling_rate": sr, "raw": stream})["text"]
+        if debug:
+            print("post transcriber", flush=True)
 
         if audio_state1[2]:
             try:
                 stream0 = np.concatenate(audio_state1[2])
-            except:
+            except Exception as e:
+                print("Exception: %s %s" % (str(e), traceback.format_exc()), flush=True)
                 raise
             stream0 = stream0.astype(np.float32)
             max_stream0 = np.max(np.abs(stream0) + 1E-7)
             stream0 /= max_stream0
+            if debug:
+                print("pre stranscriber", flush=True)
             text_y = transcriber({"sampling_rate": sr, "raw": stream0})["text"]
+            if debug:
+                print("post stranscriber", flush=True)
         else:
             text_y = None
 
@@ -74,7 +120,8 @@ def transcribe(audio_state1, new_chunk, transcriber=None, max_chunks=None, sst_f
         if reject_no_new_text and (text == text_y):
             if debug:
                 print("Rejected non-textual chunk: %s" % avg, flush=True)
-            # if didn't generate text, reject the chunk.  E.g. when typing on keyboard that ends up being loud enough but is definitely not words.
+                # if didn't generate text, reject the chunk.
+                # E.g. when typing on keyboard that ends up being loud enough but is definitely not words.
         else:
             audio_state1[2] = chunks_new
     else:
